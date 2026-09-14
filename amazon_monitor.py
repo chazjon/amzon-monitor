@@ -10,12 +10,14 @@ amazon_monitor.py — 亚马逊商品评分/评论数每日监控
      - 失败重试最多 3 次（退避 5/10/15 秒 + 随机抖动）
   3. 结果写回同一表格：每个商品一行、每天一列（最新日期插在 B 列，历史保留）
      单元格格式沿用现有约定："4.8 (97)"；无评分写 "-"；最终失败写 "抓取失败"
-  4. stdout 输出运行摘要，退出码 0=正常结束（允许部分商品失败），2=致命错误
+  4. 数据写回后，把当天与前一天对比，值不一致的当天单元格标黄（#FFFF00）
+  5. stdout 输出运行摘要，退出码 0=正常结束（允许部分商品失败），2=致命错误
 
 用法：
-  python3 amazon_monitor.py            # 正常运行（抓取 + 写回）
-  python3 amazon_monitor.py --dry-run  # 抓取并打印结果，不写回表格
+  python3 amazon_monitor.py            # 正常运行（抓取 + 写回 + 差异标黄）
+  python3 amazon_monitor.py --dry-run  # 抓取并打印结果，不写回/不标黄
   python3 amazon_monitor.py --limit N  # 只处理前 N 个去重后的 ASIN（调试）
+  python3 amazon_monitor.py --url <表> # 覆盖目标飞书表格 URL（如测试副本表）
 
 依赖：httpx（pip install httpx）、lark-cli（已登录飞书用户身份）
 网络：自动遵循环境变量 HTTP_PROXY / HTTPS_PROXY（httpx trust_env）
@@ -32,7 +34,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -42,6 +44,9 @@ import httpx
 
 SPREADSHEET_URL = "https://tcn4m7idpero.feishu.cn/sheets/HpK9swqZwhiCKztODP3c17twn4f"
 SHEET_NAMES = ["监控数据", "戒指监测2"]
+
+# 当前实际使用的表格 URL；默认生产表，也可用 --url 覆盖（用于测试副本表）
+_ACTIVE_URL = SPREADSHEET_URL
 
 AMAZON_DP_URL = "https://www.amazon.com/dp/{asin}"
 
@@ -123,7 +128,7 @@ class FatalError(Exception):
 
 def lark(args):
     """调用 lark-cli sheets 子命令，返回 data 字段；失败抛 FatalError。"""
-    cmd = ["lark-cli", "sheets", *args, "--url", SPREADSHEET_URL]
+    cmd = ["lark-cli", "sheets", *args, "--url", _ACTIVE_URL]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
                            env=LARK_ENV, timeout=180)
@@ -216,6 +221,47 @@ def write_results(info, col, results, dry_run):
     return len(writes)
 
 
+def compare_and_highlight(sheet_name, dry_run):
+    """对比当天与前一天的单元格值，不一致时把当天单元格标黄。
+
+    返回 (标黄数, 描述)。以表头中的日期为准定位今日列与前一日列，
+    仅当两个对应的单元格当前都有值且值不同才标黄（空值/新 ASIN 不标）。
+    """
+    rows = read_sheet_rows(sheet_name)
+    header = rows.get(1, [])
+    yday = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    def find_date_col(target):
+        for i, h in enumerate(header):
+            m = DATE_PREFIX_RE.match(h)
+            if m and m.group(1) == target:
+                return i
+        return None
+
+    today_col = find_date_col(TODAY)
+    yday_col = find_date_col(yday)
+    if today_col is None or yday_col is None:
+        return 0, f"对比跳过（今日列={today_col is not None}，前一日列={yday_col is not None}）"
+
+    diff_cells = []
+    for rn in sorted(rows):
+        if rn == 1:
+            continue
+        cells = rows[rn]
+        if len(cells) <= today_col or len(cells) <= yday_col:
+            continue
+        t, y = cells[today_col], cells[yday_col]
+        if t and y and t != y:
+            diff_cells.append(f"{col_letter(today_col)}{rn}")
+
+    if diff_cells and not dry_run:
+        for rng in diff_cells:
+            lark(["+cells-set-style", "--sheet-name", sheet_name,
+                  "--range", rng, "--background-color", "#FFFF00"])
+    action = "将标黄" if dry_run else "已标黄"
+    return len(diff_cells), f"对比前一日完成：{len(diff_cells)} 处不一致{action}"
+
+
 def verify_sheets_exist():
     """确认两个工作表都存在于工作簿中。"""
     data = lark(["+workbook-info"])
@@ -299,11 +345,16 @@ def fetch_product(client, asin):
 
 
 def main():
+    global _ACTIVE_URL
     dry_run = "--dry-run" in sys.argv
     limit = None
     if "--limit" in sys.argv:
         i = sys.argv.index("--limit")
         limit = int(sys.argv[i + 1])
+    if "--url" in sys.argv:
+        i = sys.argv.index("--url")
+        _ACTIVE_URL = sys.argv[i + 1]
+        print(f"使用指定表格: {_ACTIVE_URL}", flush=True)
 
     if shutil.which("lark-cli") is None:
         raise FatalError("未找到 lark-cli，请确认已安装并在 PATH 中")
@@ -357,7 +408,12 @@ def main():
         col_desc = f"{col} 列（新插入）" if inserted else f"{col} 列"
         print(f"工作表「{info.name}」: {action} {n} 条 -> {col_desc}", flush=True)
 
-    # 5. 摘要
+    # 5. 对比前一天，不一致把当天单元格标黄
+    for info in infos:
+        _n, desc = compare_and_highlight(info.name, dry_run)
+        print(f"工作表「{info.name}」: {desc}", flush=True)
+
+    # 6. 摘要
     ok = sum(1 for r in results.values() if r.status == "ok")
     nr = sum(1 for r in results.values() if r.status == "no_rating")
     failed = {a: r.error for a, r in results.items() if r.status == "failed"}
