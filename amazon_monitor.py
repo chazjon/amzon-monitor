@@ -4,7 +4,7 @@
 amazon_monitor.py — 亚马逊商品评分/评论数每日监控
 
 每天定时由 TRAE 定时任务触发，完整流程：
-  1. 读取飞书表格两个工作表 A 列的 ASIN（行号映射）
+  1. 读取飞书表格全部工作表 A 列的 ASIN（行号映射）
   2. 抓取亚马逊美国站商品页 https://www.amazon.com/dp/{ASIN}
      - 相邻请求随机间隔 1.3~3.0 秒，UA 池轮换，Session 保持 Cookie
      - 失败重试最多 3 次（退避 5/10/15 秒 + 随机抖动）
@@ -43,7 +43,6 @@ import httpx
 # ============================== 配置区 ==============================
 
 SPREADSHEET_URL = "https://tcn4m7idpero.feishu.cn/sheets/HpK9swqZwhiCKztODP3c17twn4f"
-SHEET_NAMES = ["监控数据", "戒指监测2"]
 
 # 当前实际使用的表格 URL；默认生产表，也可用 --url 覆盖（用于测试副本表）
 _ACTIVE_URL = SPREADSHEET_URL
@@ -262,13 +261,13 @@ def compare_and_highlight(sheet_name, dry_run):
     return len(diff_cells), f"对比前一日完成：{len(diff_cells)} 处不一致{action}"
 
 
-def verify_sheets_exist():
-    """确认两个工作表都存在于工作簿中。"""
+def list_sheet_names():
+    """列出工作簿中全部工作表名（读取所有工作表 A 列 ASIN）。"""
     data = lark(["+workbook-info"])
-    existing = {s["sheet_name"] for s in data.get("sheets", [])}
-    missing = [n for n in SHEET_NAMES if n not in existing]
-    if missing:
-        raise FatalError(f"工作簿中找不到工作表: {missing}；现有: {sorted(existing)}")
+    names = [s["sheet_name"] for s in data.get("sheets", [])]
+    if not names:
+        raise FatalError("工作簿中没有工作表")
+    return names
 
 # ============================== 亚马逊抓取 ==============================
 
@@ -363,9 +362,10 @@ def main():
     print(f"[{TODAY}] 亚马逊商品监控开始{'（dry-run，不写回）' if dry_run else ''}",
           flush=True)
 
-    # 1. 读取清单
-    verify_sheets_exist()
-    infos = [analyze_sheet(n) for n in SHEET_NAMES]
+    # 1. 读取清单（动态获取全部工作表，读取每张表 A 列 ASIN）
+    sheet_names = list_sheet_names()
+    print(f"工作表: {sheet_names}", flush=True)
+    infos = [analyze_sheet(n) for n in sheet_names]
     for info in infos:
         col_desc = (f"已存在今日列 {col_letter(info.today_col_idx)}"
                     if info.today_col_idx is not None else "无今日列，将插入 B 列")
