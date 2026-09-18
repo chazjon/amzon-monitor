@@ -49,10 +49,10 @@ _ACTIVE_URL = SPREADSHEET_URL
 
 AMAZON_DP_URL = "https://www.amazon.com/dp/{asin}"
 
-REQUEST_INTERVAL_MIN = 1.3      # 相邻商品请求最小间隔（秒）
-REQUEST_INTERVAL_MAX = 3.0      # 相邻商品请求最大间隔（秒）
+REQUEST_INTERVAL_MIN = 3.0      # 相邻商品请求最小间隔（秒，已延长降低反爬触发）
+REQUEST_INTERVAL_MAX = 6.0      # 相邻商品请求最大间隔（秒，已延长降低反爬触发）
 MAX_RETRIES = 3                 # 单链接最大尝试次数
-RETRY_BACKOFF = [5, 10, 15]     # 第 1/2/3 次重试前的退避秒数（另加 0~2 秒抖动）
+RETRY_BACKOFF = [15, 30, 45]    # 第 1/2/3 次重试前的退避秒数（已延长冷却，另加 0~2 秒抖动）
 REQUEST_TIMEOUT = 25            # 单次 HTTP 超时（秒）
 
 TZ = ZoneInfo("Asia/Shanghai")
