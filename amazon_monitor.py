@@ -54,6 +54,7 @@ REQUEST_INTERVAL_MAX = 3.0      # 相邻商品请求最大间隔（秒）
 MAX_RETRIES = 3                 # 单链接最大尝试次数
 RETRY_BACKOFF = [5, 10, 15]     # 第 1/2/3 次重试前的退避秒数（另加 0~2 秒抖动）
 REQUEST_TIMEOUT = 25            # 单次 HTTP 超时（秒）
+SUMMARY_WINDOW = 20000          # 主评分摘要区解析窗口（#averageCustomerReviews 之后字符数）
 
 TZ = ZoneInfo("Asia/Shanghai")
 TODAY = datetime.now(TZ).strftime("%Y-%m-%d")
@@ -92,10 +93,6 @@ REVIEWS_RES = [
     # 新版：文本 "N global ratings"
     re.compile(r'([\d,]+)\s+global ratings', re.I),
 ]
-# 相关商品/推荐位起点标记：主商品区在它之前，避免把“相关商品”卡片的评分/评论数误当主商品
-CAROUSEL_RE = re.compile(
-    r'pd_(?:sbs|day0|bmx)_d_sccl|data-component-type="s-search-result"'
-    r'|data-component-type="sp-sponsored-result"')
 # 新版页面懒加载标记：评分摘要由前端 AJAX 渲染，服务端 HTML 无评分/评论数
 LAZY_REVIEWS_RE = re.compile(r'lazyWidgetLoaderUrl|data-lazy-widget-triggered="false"')
 # 新版页面直方图百分比（判断商品是否真的有评分）
@@ -288,33 +285,42 @@ def list_sheet_names():
 
 
 def parse_product_page(html):
-    """从商品页 HTML 提取 (评分, 评论数, 懒加载标记, 直方图标记)。
+    """从商品页 HTML 提取 (评分, 评论数, 懒加载标记, 是否有评分直方图)。
 
-    解析仅在主商品区（页面开头到第一个相关商品/推荐位标记之前）进行，
-    避免把“相关商品/推荐位”卡片的评分、评论数误当作主商品数据。
+    只在主商品评分摘要区（#averageCustomerReviews / #productTitle 附近的
+    SUMMARY_WINDOW 窗口内）解析，避免把页面后方“相关商品/推荐位”卡片的
+    评分、评论数误当作主商品数据。
     """
-    main_html = html
-    m = CAROUSEL_RE.search(html)
-    if m:
-        main_html = html[:m.start()]
+    m = PRODUCT_TITLE_RE.search(html)
+    title_pos = m.start() if m else None
+    avg = re.search(r'id="averageCustomerReviews"', html)
+    anchor = avg.start() if avg else title_pos
+
+    if anchor is not None:
+        window = html[anchor:anchor + SUMMARY_WINDOW]
+    else:
+        window = html  # 无标题/摘要锚点时退化为全页（极少见）
 
     rating = None
-    m = RATING_RE.search(main_html) or RATING_RE_FALLBACK.search(main_html)
+    m = RATING_RE.search(window)
+    if not m:
+        m = RATING_RE_FALLBACK.search(window)
     if m:
         rating = m.group(1)
 
     reviews = None
     for rx in REVIEWS_RES:
-        mr = rx.search(main_html)
+        mr = rx.search(window)
         if mr:
             reviews = mr.group(1).replace(",", "")
             break
 
     # 新版页面懒加载：评分摘要由前端 AJAX 渲染，服务端 HTML 无评分/评论数
     lazy = LAZY_REVIEWS_RE.search(html) is not None
-    # 新版页面直方图百分比：存在即代表商品确有评分数据
-    has_histogram = HISTOGRAM_PCT_RE.search(main_html) is not None
-    return rating, reviews, lazy, has_histogram
+    # 直方图百分比：全部为 0% 说明商品确实没有评分（有评分则存在非零百分比）
+    hist_pcts = [float(x) for x in HISTOGRAM_PCT_RE.findall(html)]
+    has_ratings = any(p > 0 for p in hist_pcts) if hist_pcts else False
+    return rating, reviews, lazy, has_ratings
 
 
 def make_client():
@@ -356,20 +362,20 @@ def fetch_product(client, asin):
             elif "validateCaptcha" in str(resp.url) or CAPTCHA_RE.search(resp.text):
                 last_err = "命中验证码/反爬页面"
             else:
-                rating, reviews, lazy, has_histogram = parse_product_page(resp.text)
-                if rating and reviews:
+                rating, reviews, lazy, has_ratings = parse_product_page(resp.text)
+                if rating and reviews and reviews != "0":
                     return ScrapeResult(asin, "ok", rating, reviews,
                                         attempts=attempt)
                 if PRODUCT_TITLE_RE.search(resp.text):
-                    if rating is None and reviews is None:
+                    if rating is None or reviews is None or reviews == "0":
                         if lazy:
                             # 新版页面：评分摘要由前端 AJAX 懒加载，服务端 HTML 无数据
                             return ScrapeResult(asin, "no_rating", attempts=attempt,
                                                 error="新版页面：评分摘要懒加载，服务端无数据")
-                        if not has_histogram:
-                            # 无评分直方图：商品确实没有评分/评论
+                        if not has_ratings:
+                            # 直方图缺失或全为 0%：商品确实没有评分/评论
                             return ScrapeResult(asin, "no_rating", attempts=attempt)
-                        last_err = "页面解析不完整（直方图存在但未解析到评分/评论数）"
+                        last_err = "页面解析不完整（直方图显示有评分但未解析到数据）"
                     else:
                         last_err = "页面解析不完整（缺评分或评论数元素）"
                 else:
