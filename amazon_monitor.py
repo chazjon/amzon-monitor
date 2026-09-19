@@ -81,10 +81,25 @@ LARK_ENV = {
 RATING_RE = re.compile(r'id="acrPopover"[^>]*title="([0-9.]+) out of 5 stars"')
 RATING_RE_FALLBACK = re.compile(r'([0-9]\.[0-9]) out of 5 stars')
 REVIEWS_RES = [
+    # 旧版：acrCustomerReviewText 文本 "(83)"
     re.compile(r'id="acrCustomerReviewText"[^>]*>\s*\(?([\d,]+)\)?\s*<'),
+    # 旧版：acrCustomerReviewText 的 aria-label="83 Reviews"
     re.compile(r'id="acrCustomerReviewText"[^>]*aria-label="([\d,]+)', re.I),
+    # 旧版：通用 aria-label="N Reviews/Ratings"
     re.compile(r'aria-label="([\d,]+)\s+(?:Reviews?|ratings?)"', re.I),
+    # 新版：aria-label/文本 "4.2 out of 5 stars, 216 ratings"（主区限定）
+    re.compile(r'out of 5 stars[,:\s]*([\d,]+)\s+ratings?', re.I),
+    # 新版：文本 "N global ratings"
+    re.compile(r'([\d,]+)\s+global ratings', re.I),
 ]
+# 相关商品/推荐位起点标记：主商品区在它之前，避免把“相关商品”卡片的评分/评论数误当主商品
+CAROUSEL_RE = re.compile(
+    r'pd_(?:sbs|day0|bmx)_d_sccl|data-component-type="s-search-result"'
+    r'|data-component-type="sp-sponsored-result"')
+# 新版页面懒加载标记：评分摘要由前端 AJAX 渲染，服务端 HTML 无评分/评论数
+LAZY_REVIEWS_RE = re.compile(r'lazyWidgetLoaderUrl|data-lazy-widget-triggered="false"')
+# 新版页面直方图百分比（判断商品是否真的有评分）
+HISTOGRAM_PCT_RE = re.compile(r'([\d.]+)\s*percent of reviews have', re.I)
 CAPTCHA_RE = re.compile(
     r'(Enter the characters you see below|Type the characters you see in this image'
     r'|Robot Check|validateCaptcha|are not a robot)', re.I)
@@ -273,18 +288,33 @@ def list_sheet_names():
 
 
 def parse_product_page(html):
-    """从商品页 HTML 提取 (评分, 评论数)；找不到返回 (None, None)。"""
+    """从商品页 HTML 提取 (评分, 评论数, 懒加载标记, 直方图标记)。
+
+    解析仅在主商品区（页面开头到第一个相关商品/推荐位标记之前）进行，
+    避免把“相关商品/推荐位”卡片的评分、评论数误当作主商品数据。
+    """
+    main_html = html
+    m = CAROUSEL_RE.search(html)
+    if m:
+        main_html = html[:m.start()]
+
     rating = None
-    m = RATING_RE.search(html) or RATING_RE_FALLBACK.search(html)
+    m = RATING_RE.search(main_html) or RATING_RE_FALLBACK.search(main_html)
     if m:
         rating = m.group(1)
+
     reviews = None
     for rx in REVIEWS_RES:
-        mr = rx.search(html)
+        mr = rx.search(main_html)
         if mr:
             reviews = mr.group(1).replace(",", "")
             break
-    return rating, reviews
+
+    # 新版页面懒加载：评分摘要由前端 AJAX 渲染，服务端 HTML 无评分/评论数
+    lazy = LAZY_REVIEWS_RE.search(html) is not None
+    # 新版页面直方图百分比：存在即代表商品确有评分数据
+    has_histogram = HISTOGRAM_PCT_RE.search(main_html) is not None
+    return rating, reviews, lazy, has_histogram
 
 
 def make_client():
@@ -326,14 +356,24 @@ def fetch_product(client, asin):
             elif "validateCaptcha" in str(resp.url) or CAPTCHA_RE.search(resp.text):
                 last_err = "命中验证码/反爬页面"
             else:
-                rating, reviews = parse_product_page(resp.text)
+                rating, reviews, lazy, has_histogram = parse_product_page(resp.text)
                 if rating and reviews:
                     return ScrapeResult(asin, "ok", rating, reviews,
                                         attempts=attempt)
-                if rating is None and reviews is None \
-                        and PRODUCT_TITLE_RE.search(resp.text):
-                    return ScrapeResult(asin, "no_rating", attempts=attempt)
-                last_err = "页面解析不完整（缺评分或评论数元素）"
+                if PRODUCT_TITLE_RE.search(resp.text):
+                    if rating is None and reviews is None:
+                        if lazy:
+                            # 新版页面：评分摘要由前端 AJAX 懒加载，服务端 HTML 无数据
+                            return ScrapeResult(asin, "no_rating", attempts=attempt,
+                                                error="新版页面：评分摘要懒加载，服务端无数据")
+                        if not has_histogram:
+                            # 无评分直方图：商品确实没有评分/评论
+                            return ScrapeResult(asin, "no_rating", attempts=attempt)
+                        last_err = "页面解析不完整（直方图存在但未解析到评分/评论数）"
+                    else:
+                        last_err = "页面解析不完整（缺评分或评论数元素）"
+                else:
+                    last_err = "未找到商品标题（productTitle）"
         except Exception as e:                      # 超时/连接错误等
             last_err = f"{type(e).__name__}: {e}"
         if attempt < MAX_RETRIES:
