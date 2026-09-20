@@ -51,6 +51,8 @@ AMAZON_DP_URL = "https://www.amazon.com/dp/{asin}"
 
 REQUEST_INTERVAL_MIN = 1.3      # 相邻商品请求最小间隔（秒）
 REQUEST_INTERVAL_MAX = 3.0      # 相邻商品请求最大间隔（秒）
+UA_VERIFY_INTERVAL_MIN = 6.0    # 空页面疑似反爬时，换 UA 重试前的更慢间隔（降低频率）
+UA_VERIFY_INTERVAL_MAX = 10.0
 MAX_RETRIES = 3                 # 单链接最大尝试次数
 RETRY_BACKOFF = [5, 10, 15]     # 第 1/2/3 次重试前的退避秒数（另加 0~2 秒抖动）
 REQUEST_TIMEOUT = 25            # 单次 HTTP 超时（秒）
@@ -346,13 +348,39 @@ def make_client():
 
 
 def fetch_product(client, asin):
-    """抓取单个 ASIN，含重试。返回 ScrapeResult。"""
+    """抓取单个 ASIN，含重试。返回 ScrapeResult。
+
+    遇到"空页面"（懒加载空数据）时，可能是反爬导致部分 JS 未加载、服务端
+    无评分数据。此时会放慢间隔并更换 User-Agent 重新抓一次以验证：换 UA 后
+    能取到数据 → 判定为反爬，本次按成功返回并标记已降低频率；换 UA 后仍取
+    不到 → 确认为商品本身无评分/懒加载空数据。
+    """
     url = AMAZON_DP_URL.format(asin=asin)
+
+    def _get():
+        client.headers["User-Agent"] = random.choice(USER_AGENTS)
+        return client.get(url)
+
+    def _verify_ua(attempt):
+        """空页面验证：放慢频率 + 换 UA 再抓一次。成功返回 ScrapeResult，否则 None。"""
+        time.sleep(random.uniform(UA_VERIFY_INTERVAL_MIN, UA_VERIFY_INTERVAL_MAX))
+        client.headers["User-Agent"] = random.choice(USER_AGENTS)
+        try:
+            resp = client.get(url)
+        except Exception:
+            return None
+        if resp.status_code != 200 or CAPTCHA_RE.search(resp.text):
+            return None
+        rating, reviews, lazy, has_ratings = parse_product_page(resp.text)
+        if rating and reviews and reviews != "0":
+            return ScrapeResult(asin, "ok", rating, reviews, attempts=attempt,
+                                error="疑似反爬：换 User-Agent 后成功（已降低频率）")
+        return None
+
     last_err = ""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            client.headers["User-Agent"] = random.choice(USER_AGENTS)
-            resp = client.get(url)
+            resp = _get()
             code = resp.status_code
             if code == 404:
                 return ScrapeResult(asin, "failed", attempts=attempt,
@@ -368,16 +396,16 @@ def fetch_product(client, asin):
                                         attempts=attempt)
                 if PRODUCT_TITLE_RE.search(resp.text):
                     if rating is None or reviews is None or reviews == "0":
-                        if lazy:
-                            # 新版页面：评分摘要由前端 AJAX 懒加载，服务端 HTML 无数据
+                        if lazy or has_ratings:
+                            # 空页面但疑似有评分数据：先换 UA 验证是否被反爬
+                            vr = _verify_ua(attempt)
+                            if vr is not None:
+                                return vr
                             return ScrapeResult(asin, "no_rating", attempts=attempt,
-                                                error="新版页面：评分摘要懒加载，服务端无数据")
-                        if not has_ratings:
-                            # 直方图缺失或全为 0%：商品确实没有评分/评论
-                            return ScrapeResult(asin, "no_rating", attempts=attempt)
-                        last_err = "页面解析不完整（直方图显示有评分但未解析到数据）"
-                    else:
-                        last_err = "页面解析不完整（缺评分或评论数元素）"
+                                                error="懒得加载/疑似反爬，换 UA 后仍无数据")
+                        # 直方图缺失或全为 0%：商品确实没有评分/评论
+                        return ScrapeResult(asin, "no_rating", attempts=attempt)
+                    last_err = "页面解析不完整（缺评分或评论数元素）"
                 else:
                     last_err = "未找到商品标题（productTitle）"
         except Exception as e:                      # 超时/连接错误等
