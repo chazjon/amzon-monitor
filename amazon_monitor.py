@@ -38,7 +38,14 @@ from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-import httpx
+try:
+    import httpx
+except ModuleNotFoundError:
+    # 定时任务所在环境可能被重置而缺依赖：自动补装后重新导入，保证任务可用
+    print("未找到 httpx，正在自动安装...", file=sys.stderr, flush=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "httpx"],
+                   check=True)
+    import httpx
 
 # ============================== 配置区 ==============================
 
