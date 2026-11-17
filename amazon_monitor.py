@@ -403,14 +403,15 @@ def fetch_product(client, asin):
                                         attempts=attempt)
                 if PRODUCT_TITLE_RE.search(resp.text):
                     if rating is None or reviews is None or reviews == "0":
-                        if lazy or has_ratings:
-                            # 空页面但疑似有评分数据：先换 UA 验证是否被反爬
+                        if has_ratings:
+                            # 直方图显示有评分但解析不到：可能反爬，换 UA 验证
                             vr = _verify_ua(attempt)
                             if vr is not None:
                                 return vr
                             return ScrapeResult(asin, "no_rating", attempts=attempt,
-                                                error="懒得加载/疑似反爬，换 UA 后仍无数据")
-                        # 直方图缺失或全为 0%：商品确实没有评分/评论
+                                                error="懒加载/疑似反爬，换 UA 后仍无数据")
+                        # 直方图缺失或全为 0%：商品确实没有评分/评论，直接判无评分
+                        # （不再为此类页面做换 UA 验证，避免每个空页面多耗 6-10s）
                         return ScrapeResult(asin, "no_rating", attempts=attempt)
                     last_err = "页面解析不完整（缺评分或评论数元素）"
                 else:
@@ -463,12 +464,25 @@ def main():
         asins = asins[:limit]
     print(f"去重后待抓取: {len(asins)} 个", flush=True)
 
-    # 3. 抓取
+    # 3. 先建好所有工作表的今日列（供分批写回使用，避免重复插入）
+    today_cols = {}
+    for info in infos:
+        col, inserted = ensure_today_column(info, dry_run)
+        today_cols[info.name] = col
+        if not dry_run:
+            col_desc = f"{col} 列（新插入）" if inserted else f"{col} 列"
+            print(f"工作表「{info.name}」: 今日列 {col_desc} 已就绪", flush=True)
+
+    # 4. 分批抓取 + 分批写回：每 BATCH_SIZE 个写回一次，防止前台超时被 kill
+    #    导致全部结果丢失（此前 99/267 被 kill、未触发写回的问题）
+    BATCH_SIZE = 20
     results = {}
+    batch = {}
     client = make_client()
     for i, asin in enumerate(asins):
         res = fetch_product(client, asin)
         results[asin] = res
+        batch[asin] = res
         if res.status == "ok":
             detail = res.cell_text()
         elif res.status == "no_rating":
@@ -477,17 +491,16 @@ def main():
             detail = f"失败（{res.error}）"
         print(f"  [{i + 1}/{len(asins)}] {asin} -> {detail}"
               f"（第 {res.attempts} 次请求）", flush=True)
+        if (i + 1) % BATCH_SIZE == 0 or i == len(asins) - 1:
+            action = "将写回" if dry_run else "已写回"
+            for info in infos:
+                write_results(info, today_cols[info.name], batch, dry_run)
+            print(f"  [批次写回] 进度 {i + 1}/{len(asins)}，本批 {len(batch)} 个{action}",
+                  flush=True)
+            batch = {}
         if i < len(asins) - 1:
             time.sleep(random.uniform(REQUEST_INTERVAL_MIN, REQUEST_INTERVAL_MAX))
     client.close()
-
-    # 4. 写回表格
-    for info in infos:
-        col, inserted = ensure_today_column(info, dry_run)
-        n = write_results(info, col, results, dry_run)
-        action = "将写入" if dry_run else "已写入"
-        col_desc = f"{col} 列（新插入）" if inserted else f"{col} 列"
-        print(f"工作表「{info.name}」: {action} {n} 条 -> {col_desc}", flush=True)
 
     # 5. 对比前一天，不一致把当天单元格标黄
     for info in infos:
