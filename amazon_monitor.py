@@ -8,10 +8,14 @@ amazon_monitor.py — 亚马逊商品评分/评论数每日监控
   2. 抓取亚马逊美国站商品页 https://www.amazon.com/dp/{ASIN}
      - 相邻请求随机间隔 1.3~3.0 秒，UA 池轮换，Session 保持 Cookie
      - 失败重试最多 3 次（退避 5/10/15 秒 + 随机抖动）
+     - 拦截页（验证码/软拦截/无 productTitle）快速失败，不做 3 次空转重试
+     - 连续 6 个页面被拦截即熔断中止，避免整列写入“抓取失败”污染数据
   3. 结果写回同一表格：每个商品一行、每天一列（最新日期插在 B 列，历史保留）
      单元格格式沿用现有约定："4.8 (97)"；无评分写 "-"；最终失败写 "抓取失败"
+     每抓 20 个 ASIN 分批写回一次，前台超时被 kill 也不会丢失已抓数据
   4. 数据写回后，把当天与前一天对比，值不一致的当天单元格标黄（#FFFF00）
-  5. stdout 输出运行摘要，退出码 0=正常结束（允许部分商品失败），2=致命错误
+  5. stdout 输出运行摘要，退出码 0=正常结束（允许部分商品失败），2=致命错误，
+     3=疑似反爬熔断中止（未写入的 ASIN 保持空列，换 IP 后重跑可覆盖补齐）
 
 用法：
   python3 amazon_monitor.py            # 正常运行（抓取 + 写回 + 差异标黄）
@@ -65,6 +69,9 @@ RETRY_BACKOFF = [5, 10, 15]     # 第 1/2/3 次重试前的退避秒数（另加
 REQUEST_TIMEOUT = 25            # 单次 HTTP 超时（秒）
 SUMMARY_WINDOW = 20000          # 主评分摘要区解析窗口（#averageCustomerReviews 之后字符数）
 
+BLOCK_ABORT_THRESHOLD = 6       # 连续 N 个页面被拦截即判定为整体反爬，立即中止任务
+MIN_PAGE_LEN = 5000             # 页面 HTML 过短视为异常页（正常商品页远大于此）
+
 TZ = ZoneInfo("Asia/Shanghai")
 TODAY = datetime.now(TZ).strftime("%Y-%m-%d")
 
@@ -109,6 +116,16 @@ HISTOGRAM_PCT_RE = re.compile(r'([\d.]+)\s*percent of reviews have', re.I)
 CAPTCHA_RE = re.compile(
     r'(Enter the characters you see below|Type the characters you see in this image'
     r'|Robot Check|validateCaptcha|are not a robot)', re.I)
+# 亚马逊软拦截/异常页特征（HTTP 200 但无 productTitle 的常见封锁页）
+BLOCK_RE = re.compile(
+    r'(Sorry! Something went wrong'
+    r'|api-services-support@amazon\.com'
+    r'|To discuss automated access to Amazon data'
+    r'|automated access to our (?:site|data)'
+    r'|Request could not be satisfied'
+    r'|Bot Verification'
+    r'|we just need to make sure you.re not a robot'
+    r'|Service Unavailable)', re.I)
 PRODUCT_TITLE_RE = re.compile(r'id="productTitle"')
 DATE_PREFIX_RE = re.compile(r'^\s*(\d{4}-\d{2}-\d{2})')
 
@@ -126,7 +143,7 @@ class SheetInfo:
 @dataclass
 class ScrapeResult:
     asin: str
-    status: str                          # "ok" | "no_rating" | "failed"
+    status: str                          # "ok" | "no_rating" | "blocked" | "failed"
     rating: Optional[str] = None
     reviews: Optional[str] = None
     attempts: int = 0
@@ -224,12 +241,18 @@ def ensure_today_column(info, dry_run):
     return "B", True
 
 
-def write_results(info, col, results, dry_run):
-    """把抓取结果批量写入指定列。返回写入条数。"""
+def write_results(info, col, results, dry_run, only_success=False):
+    """把抓取结果批量写入指定列。返回写入条数。
+
+    only_success=True 时只写 ok/no_rating，跳过 blocked/failed
+    （用于反爬熔断时避免把整列写成“抓取失败”污染数据）。
+    """
     writes = []
     for asin, rn in info.asin_rows.items():
         res = results.get(asin)
         if res is None:
+            continue
+        if only_success and res.status not in ("ok", "no_rating"):
             continue
         writes.append({"sheet_name": info.name, "range": f"{col}{rn}",
                        "cells": [[{"value": res.cell_text()}]]})
@@ -395,7 +418,13 @@ def fetch_product(client, asin):
             if code != 200:
                 last_err = f"HTTP {code}"
             elif "validateCaptcha" in str(resp.url) or CAPTCHA_RE.search(resp.text):
-                last_err = "命中验证码/反爬页面"
+                # 验证码页：立即判为拦截，不再重试 3 次白耗 30s/个
+                return ScrapeResult(asin, "blocked", attempts=attempt,
+                                    error="命中验证码页")
+            elif BLOCK_RE.search(resp.text) or len(resp.text) < MIN_PAGE_LEN:
+                # 软拦截页/异常短页：立即判为拦截
+                return ScrapeResult(asin, "blocked", attempts=attempt,
+                                    error="疑似反爬拦截（软拦截页/页面过短）")
             else:
                 rating, reviews, lazy, has_ratings = parse_product_page(resp.text)
                 if rating and reviews and reviews != "0":
@@ -415,7 +444,10 @@ def fetch_product(client, asin):
                         return ScrapeResult(asin, "no_rating", attempts=attempt)
                     last_err = "页面解析不完整（缺评分或评论数元素）"
                 else:
-                    last_err = "未找到商品标题（productTitle）"
+                    # 无 productTitle：判定为拦截页并立即返回（不重试），
+                    # 由主流程的连续拦截熔断机制整体中止，避免空转 60+ 分钟
+                    return ScrapeResult(asin, "blocked", attempts=attempt,
+                                        error="未找到商品标题（productTitle），疑似反爬拦截")
         except Exception as e:                      # 超时/连接错误等
             last_err = f"{type(e).__name__}: {e}"
         if attempt < MAX_RETRIES:
@@ -478,29 +510,79 @@ def main():
     BATCH_SIZE = 20
     results = {}
     batch = {}
+    consecutive_blocked = 0
+    blocked_systemic = False
     client = make_client()
-    for i, asin in enumerate(asins):
-        res = fetch_product(client, asin)
-        results[asin] = res
-        batch[asin] = res
-        if res.status == "ok":
-            detail = res.cell_text()
-        elif res.status == "no_rating":
-            detail = "无评分"
-        else:
-            detail = f"失败（{res.error}）"
-        print(f"  [{i + 1}/{len(asins)}] {asin} -> {detail}"
-              f"（第 {res.attempts} 次请求）", flush=True)
-        if (i + 1) % BATCH_SIZE == 0 or i == len(asins) - 1:
-            action = "将写回" if dry_run else "已写回"
-            for info in infos:
-                write_results(info, today_cols[info.name], batch, dry_run)
-            print(f"  [批次写回] 进度 {i + 1}/{len(asins)}，本批 {len(batch)} 个{action}",
-                  flush=True)
-            batch = {}
-        if i < len(asins) - 1:
-            time.sleep(random.uniform(REQUEST_INTERVAL_MIN, REQUEST_INTERVAL_MAX))
-    client.close()
+
+    def flush(batch_results, only_success=False):
+        """把一批结果写回所有工作表；批次为空则跳过。"""
+        if not batch_results:
+            return
+        for info in infos:
+            write_results(info, today_cols[info.name], batch_results,
+                          dry_run, only_success=only_success)
+
+    try:
+        for i, asin in enumerate(asins):
+            res = fetch_product(client, asin)
+            results[asin] = res
+            batch[asin] = res
+            if res.status == "blocked":
+                consecutive_blocked += 1
+            else:
+                consecutive_blocked = 0
+
+            if res.status == "ok":
+                detail = res.cell_text()
+            elif res.status == "no_rating":
+                detail = "无评分"
+            elif res.status == "blocked":
+                detail = f"被拦截（{res.error}）"
+            else:
+                detail = f"失败（{res.error}）"
+            print(f"  [{i + 1}/{len(asins)}] {asin} -> {detail}"
+                  f"（第 {res.attempts} 次请求）", flush=True)
+
+            # 熔断：连续多个页面被拦截，判定整体反爬，立即中止（不写失败值）
+            if consecutive_blocked >= BLOCK_ABORT_THRESHOLD:
+                blocked_systemic = True
+                flush(batch, only_success=True)
+                batch = {}
+                print(f"\n[熔断] 连续 {consecutive_blocked} 个页面被反爬拦截，"
+                      f"判定当前出口 IP 被亚马逊封锁，立即中止任务。", flush=True)
+                print(f"        已处理 {i + 1}/{len(asins)} 个，"
+                      f"其余 ASIN 不写入（保持空列，避免写入“{FAIL_TEXT}”污染数据）。",
+                      flush=True)
+                print("        处理建议：更换出口 IP/代理后重跑；"
+                      "今日列已存在，重跑为覆盖写入，可自动补齐。", flush=True)
+                break
+
+            if (i + 1) % BATCH_SIZE == 0 or i == len(asins) - 1:
+                action = "将写回" if dry_run else "已写回"
+                flush(batch)
+                print(f"  [批次写回] 进度 {i + 1}/{len(asins)}，"
+                      f"本批 {len(batch)} 个{action}", flush=True)
+                batch = {}
+            if i < len(asins) - 1:
+                time.sleep(random.uniform(REQUEST_INTERVAL_MIN, REQUEST_INTERVAL_MAX))
+    finally:
+        # 无论正常结束、熔断中止还是异常退出，都确保最后一个不足 20 的批次写回
+        flush(batch)
+        client.close()
+
+    # 4.1 熔断中止：输出诊断摘要并按退出码 3 结束（跳过标黄对比）
+    if blocked_systemic:
+        ok = sum(1 for r in results.values() if r.status == "ok")
+        nr = sum(1 for r in results.values() if r.status == "no_rating")
+        blk = sum(1 for r in results.values() if r.status == "blocked")
+        print("============ 运行中止（疑似反爬拦截） ============", flush=True)
+        print(f"日期: {TODAY}", flush=True)
+        print(f"已抓取: {len(results)} | 成功: {ok} | 无评分: {nr} | 被拦截: {blk}",
+              flush=True)
+        print(f"耗时: {int(time.time() - started)}s", flush=True)
+        print("说明: 被拦截/未处理的 ASIN 未写入，保持空列。换 IP 后重跑即可覆盖补齐。",
+              flush=True)
+        return 3
 
     # 5. 对比前一天，不一致把当天单元格标黄
     for info in infos:
