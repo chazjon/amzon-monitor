@@ -45,11 +45,20 @@ from zoneinfo import ZoneInfo
 try:
     import httpx
 except ModuleNotFoundError:
-    # 定时任务所在环境可能被重置而缺依赖：自动补装后重新导入，保证任务可用
     print("未找到 httpx，正在自动安装...", file=sys.stderr, flush=True)
     subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "httpx"],
                    check=True)
     import httpx
+
+try:
+    import scrapling
+except ModuleNotFoundError:
+    print("未找到 scrapling，正在自动安装...", file=sys.stderr, flush=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "scrapling[fetchers]>=0.3.9,<0.4.0"],
+                   check=True)
+    import scrapling
+
+from fetching import ScraplingBackend, HttpxBackend, ChainBackend, BaseBackend
 
 # ============================== 配置区 ==============================
 
@@ -355,74 +364,68 @@ def parse_product_page(html):
     return rating, reviews, lazy, has_ratings
 
 
-def make_client():
-    client = httpx.Client(
-        follow_redirects=True,
-        trust_env=True,           # 自动使用 HTTP_PROXY / HTTPS_PROXY
-        timeout=REQUEST_TIMEOUT,
-        headers={
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "DNT": "1",
-        },
-    )
-    client.cookies.set("lc-main", "en_US", domain=".amazon.com")
-    client.cookies.set("i18n-prefs", "USD", domain=".amazon.com")
-    return client
+def build_backend(backend_type: str = "scrapling", proxy: Optional[str] = None) -> BaseBackend:
+    """根据配置创建抓取后端"""
+    if backend_type == "scrapling":
+        return ScraplingBackend(timeout=REQUEST_TIMEOUT, proxy=proxy)
+    elif backend_type == "httpx":
+        return HttpxBackend(user_agents=USER_AGENTS, timeout=REQUEST_TIMEOUT, proxy=proxy)
+    elif backend_type == "chain":
+        s = ScraplingBackend(timeout=REQUEST_TIMEOUT, proxy=proxy)
+        h = HttpxBackend(user_agents=USER_AGENTS, timeout=REQUEST_TIMEOUT, proxy=proxy)
+        return ChainBackend([s, h])
+    else:
+        raise ValueError(f"未知的后端类型: {backend_type}")
 
 
-def fetch_product(client, asin):
-    """抓取单个 ASIN，含重试。返回 ScrapeResult。
-
-    遇到"空页面"（懒加载空数据）时，可能是反爬导致部分 JS 未加载、服务端
-    无评分数据。此时会放慢间隔并更换 User-Agent 重新抓一次以验证：换 UA 后
-    能取到数据 → 判定为反爬，本次按成功返回并标记已降低频率；换 UA 后仍取
-    不到 → 确认为商品本身无评分/懒加载空数据。
-    """
+def fetch_product(backend: BaseBackend, asin: str) -> ScrapeResult:
+    """抓取单个 ASIN，含重试与反爬验证。返回 ScrapeResult。"""
     url = AMAZON_DP_URL.format(asin=asin)
 
     def _get():
-        client.headers["User-Agent"] = random.choice(USER_AGENTS)
-        return client.get(url)
+        return backend.get(url)
 
-    def _verify_ua(attempt):
-        """空页面验证：放慢频率 + 换 UA 再抓一次。成功返回 ScrapeResult，否则 None。"""
+    def _verify_anti_bot(attempt):
+        """疑似反爬时：放慢频率 + 换指纹重新抓一次"""
         time.sleep(random.uniform(UA_VERIFY_INTERVAL_MIN, UA_VERIFY_INTERVAL_MAX))
-        client.headers["User-Agent"] = random.choice(USER_AGENTS)
         try:
-            resp = client.get(url)
+            resp = backend.get(url)
         except Exception:
             return None
-        if resp.status_code != 200 or CAPTCHA_RE.search(resp.text):
+        if resp.status != 200 or CAPTCHA_RE.search(resp.text):
             return None
         rating, reviews, lazy, has_ratings = parse_product_page(resp.text)
         if rating and reviews and reviews != "0":
             return ScrapeResult(asin, "ok", rating, reviews, attempts=attempt,
-                                error="疑似反爬：换 User-Agent 后成功（已降低频率）")
+                                error=f"疑似反爬：换指纹重试后成功 [{resp.fingerprint}]")
         return None
 
     last_err = ""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = _get()
-            code = resp.status_code
+            code = resp.status
             if code == 404:
                 return ScrapeResult(asin, "failed", attempts=attempt,
                                     error="404 商品页不存在/已下架")
-            if code != 200:
+            if code == 0:
+                last_err = resp.error or "网络请求失败"
+            elif code != 200:
                 last_err = f"HTTP {code}"
             elif "validateCaptcha" in str(resp.url) or CAPTCHA_RE.search(resp.text):
-                # 验证码页：立即判为拦截，不再重试 3 次白耗 30s/个
+                # 验证码页：尝试换指纹再跑一次，若仍是验证码则快速失败
+                if attempt == 1:
+                    vr = _verify_anti_bot(attempt)
+                    if vr is not None:
+                        return vr
                 return ScrapeResult(asin, "blocked", attempts=attempt,
                                     error="命中验证码页")
             elif BLOCK_RE.search(resp.text) or len(resp.text) < MIN_PAGE_LEN:
-                # 软拦截页/异常短页：立即判为拦截
+                # 软拦截页/异常短页（如 2.9KB 空壳页）：换指纹重试一次
+                if attempt == 1:
+                    vr = _verify_anti_bot(attempt)
+                    if vr is not None:
+                        return vr
                 return ScrapeResult(asin, "blocked", attempts=attempt,
                                     error="疑似反爬拦截（软拦截页/页面过短）")
             else:
@@ -433,19 +436,22 @@ def fetch_product(client, asin):
                 if PRODUCT_TITLE_RE.search(resp.text):
                     if rating is None or reviews is None or reviews == "0":
                         if has_ratings:
-                            # 直方图显示有评分但解析不到：可能反爬，换 UA 验证
-                            vr = _verify_ua(attempt)
+                            # 直方图显示有评分但解析不到：可能反爬，换指纹重试验证
+                            vr = _verify_anti_bot(attempt)
                             if vr is not None:
                                 return vr
                             return ScrapeResult(asin, "no_rating", attempts=attempt,
-                                                error="懒加载/疑似反爬，换 UA 后仍无数据")
+                                                error="懒加载/疑似反爬，换指纹后仍无数据")
                         # 直方图缺失或全为 0%：商品确实没有评分/评论，直接判无评分
-                        # （不再为此类页面做换 UA 验证，避免每个空页面多耗 6-10s）
                         return ScrapeResult(asin, "no_rating", attempts=attempt)
                     last_err = "页面解析不完整（缺评分或评论数元素）"
                 else:
-                    # 无 productTitle：判定为拦截页并立即返回（不重试），
+                    # 无 productTitle：换指纹重试一次，仍无则判定为拦截页并立即返回（不重试），
                     # 由主流程的连续拦截熔断机制整体中止，避免空转 60+ 分钟
+                    if attempt == 1:
+                        vr = _verify_anti_bot(attempt)
+                        if vr is not None:
+                            return vr
                     return ScrapeResult(asin, "blocked", attempts=attempt,
                                         error="未找到商品标题（productTitle），疑似反爬拦截")
         except Exception as e:                      # 超时/连接错误等
@@ -469,11 +475,21 @@ def main():
         _ACTIVE_URL = sys.argv[i + 1]
         print(f"使用指定表格: {_ACTIVE_URL}", flush=True)
 
+    backend_type = "scrapling"
+    if "--backend" in sys.argv:
+        i = sys.argv.index("--backend")
+        backend_type = sys.argv[i + 1]
+
+    proxy_arg = None
+    if "--proxy" in sys.argv:
+        i = sys.argv.index("--proxy")
+        proxy_arg = sys.argv[i + 1]
+
     if shutil.which("lark-cli") is None:
         raise FatalError("未找到 lark-cli，请确认已安装并在 PATH 中")
 
     started = time.time()
-    print(f"[{TODAY}] 亚马逊商品监控开始{'（dry-run，不写回）' if dry_run else ''}",
+    print(f"[{TODAY}] 亚马逊商品监控开始{'（dry-run，不写回）' if dry_run else ''} [后端: {backend_type}]",
           flush=True)
 
     # 1. 读取清单（动态获取全部工作表，读取每张表 A 列 ASIN）
@@ -512,7 +528,7 @@ def main():
     batch = {}
     consecutive_blocked = 0
     blocked_systemic = False
-    client = make_client()
+    backend = build_backend(backend_type=backend_type, proxy=proxy_arg)
 
     def flush(batch_results, only_success=False):
         """把一批结果写回所有工作表；批次为空则跳过。"""
@@ -524,7 +540,7 @@ def main():
 
     try:
         for i, asin in enumerate(asins):
-            res = fetch_product(client, asin)
+            res = fetch_product(backend, asin)
             results[asin] = res
             batch[asin] = res
             if res.status == "blocked":
@@ -568,7 +584,7 @@ def main():
     finally:
         # 无论正常结束、熔断中止还是异常退出，都确保最后一个不足 20 的批次写回
         flush(batch)
-        client.close()
+        backend.close()
 
     # 4.1 熔断中止：输出诊断摘要并按退出码 3 结束（跳过标黄对比）
     if blocked_systemic:
